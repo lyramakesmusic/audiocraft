@@ -18,6 +18,9 @@ import torch
 from torch import nn
 from transformers import EncodecModel as HFEncodecModel
 
+from stable_audio_tools.models.bottleneck import DACRVQBottleneck, DACRVQVAEBottleneck
+from stable_audio_tools.models import autoencoders
+
 from .. import quantization as qt
 
 
@@ -107,6 +110,45 @@ class CompressionModel(ABC, nn.Module):
             model_type = name.split('_')[1]
             logger.info("Getting pretrained compression model from DAC %s", model_type)
             model = DAC(model_type)
+        elif name in ['stereo_dac']:
+            logger.info("Getting custom compression model from stable-audio-tools DAC")
+            autoencoder = autoencoders.create_autoencoder_from_config({"model": {
+                "encoder": {
+                    "type": "dac",
+                    "config": {
+                        "in_channels": 2,
+                        "latent_dim": 128,
+                        "d_model": 128,
+                        "strides": [2, 4, 8, 8]
+                    }
+                },
+                "decoder": {
+                    "type": "dac",
+                    "config": {
+                        "out_channels": 2,
+                        "latent_dim": 128,
+                        "channels": 2048,
+                        "rates": [8, 8, 4, 2]
+                    }
+                },
+                "bottleneck": {
+                    "type": "dac_rvq",
+                    "config": {
+                        "input_dim": 128,
+                        "n_codebooks": 9,
+                        "codebook_dim": 8,
+                        "codebook_size": 2048,
+                        "quantizer_dropout": 0
+                    }
+                },
+                "latent_dim": 128,
+                "downsampling_ratio": 512,
+                "io_channels": 2
+            }, "sample_rate": 44100})
+            
+            autoencoder.load_state_dict(torch.load(f'/workspace/audiocraft/{name}.ckpt', map_location="cpu")["state_dict"])
+            model = DACRVQCompressionModel(autoencoder)
+            
         elif name in ['debug_compression_model']:
             logger.info("Getting pretrained compression model for debug")
             model = builders.get_debug_compression_model()
@@ -391,3 +433,60 @@ class HFEncodecCompressionModel(CompressionModel):
         if n not in self.possible_num_codebooks:
             raise ValueError(f"Allowed values for num codebooks: {self.possible_num_codebooks}")
         self._num_codebooks = n
+
+class DACRVQCompressionModel(CompressionModel):
+    def __init__(self, autoencoder: autoencoders.AudioAutoencoder):
+        super().__init__()
+        self.model = autoencoder.eval()
+
+        assert isinstance(self.model.bottleneck, DACRVQBottleneck) or isinstance(self.model.bottleneck, DACRVQVAEBottleneck), "Autoencoder must have a DACRVQBottleneck or DACRVQVAEBottleneck"
+
+        self.n_quantizers = self.model.bottleneck.num_quantizers
+
+    def forward(self, x: torch.Tensor) -> qt.QuantizedResult:
+        raise NotImplementedError("Forward and training with DAC RVQ not supported")
+
+    def encode(self, x: torch.Tensor) -> tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]:
+        _, info = self.model.encode(x, return_info=True, n_quantizers=self.n_quantizers)
+        codes = info["codes"]
+        return codes, None
+
+    def decode(self, codes: torch.Tensor, scale: tp.Optional[torch.Tensor] = None):
+        assert scale is None
+        z_q = self.decode_latent(codes)
+        return self.model.decode(z_q)
+
+    def decode_latent(self, codes: torch.Tensor):
+        """Decode from the discrete codes to continuous latent space."""
+        return self.model.bottleneck.quantizer.from_codes(codes)[0]
+
+    @property
+    def channels(self) -> int:
+        return self.model.io_channels
+
+    @property
+    def frame_rate(self) -> float:
+        return self.model.sample_rate / self.model.downsampling_ratio
+
+    @property
+    def sample_rate(self) -> int:
+        return self.model.sample_rate
+
+    @property
+    def cardinality(self) -> int:
+        return self.model.bottleneck.quantizer.codebook_size
+
+    @property
+    def num_codebooks(self) -> int:
+        return self.n_quantizers
+
+    @property
+    def total_codebooks(self) -> int:
+        self.model.bottleneck.num_quantizers
+
+    def set_num_codebooks(self, n: int):
+        """Set the active number of codebooks used by the quantizer.
+        """
+        assert n >= 1
+        assert n <= self.total_codebooks
+        self.n_quantizers = n
